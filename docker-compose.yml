@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: chainsentinel
+      POSTGRES_USER: chainsentinel
+      POSTGRES_PASSWORD: chainsentinel
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chainsentinel -d chainsentinel"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    command: npm run api
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-chainsentinel}:${POSTGRES_PASSWORD:-chainsentinel}@postgres:5432/${POSTGRES_DB:-chainsentinel}
+    ports:
+      - "8787:8787"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    build: .
+    command: npm run dev
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:?Set VITE_API_BASE_URL in .env before running docker compose}
+    ports:
+      - "5174:5174"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:

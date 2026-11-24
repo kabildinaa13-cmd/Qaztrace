@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { createHash, createHmac, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import pg from "pg";
@@ -81,6 +81,7 @@ const registerRateLimit = Math.max(1, Math.min(20, Number(process.env.REGISTER_R
 const authRateWindowMs = Math.max(60_000, Math.min(24 * 60 * 60 * 1000, Number(process.env.AUTH_RATE_WINDOW_MS || 15 * 60 * 1000)));
 const scryptAsync = promisify(scrypt);
 const authRateBuckets = new Map();
+const storeMutationQueues = new Map();
 const { Pool } = pg;
 const pool = usePostgres ? new Pool({ connectionString: databaseUrl }) : null;
 let etherscanQueue = Promise.resolve();
@@ -490,7 +491,12 @@ async function writeJson(file, value) {
 
   if (!usePostgres) {
     await mkdir(dirname(file), { recursive: true });
-    await writeFile(file, `${JSON.stringify(sanitizedItems, null, 2)}\n`, "utf8");
+    const tempFile = join(
+      dirname(file),
+      `.${basename(file)}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`
+    );
+    await writeFile(tempFile, `${JSON.stringify(sanitizedItems, null, 2)}\n`, "utf8");
+    await rename(tempFile, file);
     return;
   }
 
@@ -518,6 +524,38 @@ async function writeJson(file, value) {
   } finally {
     client.release();
   }
+}
+
+async function withStoreMutationLock(file, task) {
+  const prior = storeMutationQueues.get(file) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const queued = prior.then(() => gate);
+  storeMutationQueues.set(file, queued);
+  await prior;
+
+  try {
+    return await task();
+  } finally {
+    release();
+    if (storeMutationQueues.get(file) === queued) {
+      storeMutationQueues.delete(file);
+    }
+  }
+}
+
+async function mutateStore(file, mutator) {
+  return withStoreMutationLock(file, async () => {
+    const current = await readJson(file);
+    const { items, result } = await mutator(current);
+    if (!Array.isArray(items)) {
+      throw new Error("Store mutation must return an items array");
+    }
+    await writeJson(file, items);
+    return result;
+  });
 }
 
 function storeConfig(file) {
@@ -607,6 +645,12 @@ function requireAdmin(user, response) {
   if (effectiveUserRole(user) === "admin") return true;
   send(response, 403, { error: "Administrator role required" });
   return false;
+}
+
+function requestError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
 }
 
 function clientAddress(request) {
@@ -746,29 +790,28 @@ function canonicalAuditValue(value) {
 }
 
 async function appendAuditEvent({ actor, action, entityType, entityId = "", before = null, after = null, reason = "", metadata = {} }) {
-  const events = await readJson(auditEventsFile);
-  const previousHash = events[0]?.eventHash || "";
-  const unsignedEvent = {
-    id: makeId("audit"),
-    actorId: actor?.id || "system",
-    actorUsername: actor?.username || "system",
-    action,
-    entityType,
-    entityId: String(entityId || ""),
-    before,
-    after,
-    reason: String(reason || ""),
-    metadata,
-    previousHash,
-    createdAt: new Date().toISOString(),
-  };
-  const eventHash = createHash("sha256")
-    .update(JSON.stringify(canonicalAuditValue(unsignedEvent)))
-    .digest("hex");
-  const event = { ...unsignedEvent, eventHash };
-
-  await writeJson(auditEventsFile, [event, ...events].slice(0, 100_000));
-  return event;
+  return mutateStore(auditEventsFile, async (events) => {
+    const previousHash = events[0]?.eventHash || "";
+    const unsignedEvent = {
+      id: makeId("audit"),
+      actorId: actor?.id || "system",
+      actorUsername: actor?.username || "system",
+      action,
+      entityType,
+      entityId: String(entityId || ""),
+      before,
+      after,
+      reason: String(reason || ""),
+      metadata,
+      previousHash,
+      createdAt: new Date().toISOString(),
+    };
+    const eventHash = createHash("sha256")
+      .update(JSON.stringify(canonicalAuditValue(unsignedEvent)))
+      .digest("hex");
+    const event = { ...unsignedEvent, eventHash };
+    return { items: [event, ...events], result: event };
+  });
 }
 
 async function readEntityLabels() {
@@ -4717,6 +4760,13 @@ function isEvmAddress(address) {
   return /^0x[a-fA-F0-9]{40}$/.test(address || "");
 }
 
+function normalizeSupportedAddress(value) {
+  const address = String(value || "").trim();
+  if (isEvmAddress(address)) return address.toLowerCase();
+  if (isTronAddress(address) || isBitcoinAddress(address)) return address;
+  return "";
+}
+
 function traceBaseHash(tx) {
   return String(tx?.txHash || tx?.hash || "").split(":")[0];
 }
@@ -8640,33 +8690,29 @@ const server = createServer(async (request, response) => {
         return;
       }
 
-      const users = await readJson(usersFile);
-
-      // A first local user can bootstrap the system. Subsequent self-registration
-      // must be explicitly enabled by the system owner.
-      if (users.length > 0 && !registrationEnabled) {
-        send(response, 403, { error: "Registration is closed. Ask an administrator to create an account." });
-        return;
-      }
-
-      if (users.some((user) => user.username === username)) {
-        send(response, 409, { error: "Login already exists." });
-        return;
-      }
-
       const now = new Date().toISOString();
-      const user = {
-        id: userIdFromUsername(username),
-        username,
-        displayName: String(body.displayName || username).trim() || username,
-        passwordHash: await hashPassword(password),
-        role: users.length === 0 ? "admin" : "analyst",
-        sessionVersion: 0,
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      await writeJson(usersFile, [user, ...users]);
+      const passwordHash = await hashPassword(password);
+      const user = await mutateStore(usersFile, async (users) => {
+        // A first local user can bootstrap the system. Subsequent self-registration
+        // must be explicitly enabled by the system owner.
+        if (users.length > 0 && !registrationEnabled) {
+          throw requestError(403, "Registration is closed. Ask an administrator to create an account.");
+        }
+        if (users.some((item) => item.username === username)) {
+          throw requestError(409, "Login already exists.");
+        }
+        const nextUser = {
+          id: userIdFromUsername(username),
+          username,
+          displayName: String(body.displayName || username).trim() || username,
+          passwordHash,
+          role: users.length === 0 ? "admin" : "analyst",
+          sessionVersion: 0,
+          createdAt: now,
+          updatedAt: now,
+        };
+        return { items: [nextUser, ...users], result: nextUser };
+      });
       send(response, 200, { user: safeUser(user), token: createAuthToken(user) });
       return;
     }
@@ -8702,11 +8748,12 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/api/auth/logout") {
       const user = await requireAuthenticatedUser(request, response);
       if (!user) return;
-      const users = await readJson(usersFile);
-      const nextUsers = users.map((item) => item.id === user.id
-        ? { ...item, sessionVersion: Number(item.sessionVersion || 0) + 1, updatedAt: new Date().toISOString() }
-        : item);
-      await writeJson(usersFile, nextUsers);
+      await mutateStore(usersFile, async (users) => ({
+        items: users.map((item) => item.id === user.id
+          ? { ...item, sessionVersion: Number(item.sessionVersion || 0) + 1, updatedAt: new Date().toISOString() }
+          : item),
+        result: null,
+      }));
       send(response, 200, { ok: true });
       return;
     }
@@ -9056,10 +9103,10 @@ const server = createServer(async (request, response) => {
       const body = await readBody(request);
       const labels = await readEntityLabels();
       const now = new Date().toISOString();
-      const address = String(body.address || "").trim();
+      const address = normalizeSupportedAddress(body.address);
 
       if (!address) {
-        send(response, 400, { error: "address is required" });
+        send(response, 400, { error: "A valid EVM, TRON or Bitcoin address is required" });
         return;
       }
 
@@ -9146,47 +9193,45 @@ const server = createServer(async (request, response) => {
       const user = await requireAuthenticatedUser(request, response);
       if (!user) return;
       const body = await readBody(request);
-      const cases = await readJson(investigationCasesFile);
       const now = new Date().toISOString();
       const rootAddress = String(body.rootAddress || "").trim();
       const profileId = user.id;
-      const collidingCase = body.id ? cases.find((item) => item.id === body.id) : null;
-      if (collidingCase && !belongsToProfile(collidingCase, profileId)) {
-        send(response, 403, { error: "You cannot modify another user's investigation case" });
-        return;
-      }
-      const existingCase = collidingCase || null;
 
       if (!rootAddress) {
         send(response, 400, { error: "rootAddress is required" });
         return;
       }
 
-      const nextCase = {
-        id: body.id || makeId("case"),
-        profileId,
-        title: String(body.title || `Investigation ${rootAddress.slice(0, 10)}`).trim(),
-        rootAddress,
-        networkKey: String(body.networkKey || "UNKNOWN").trim(),
-        severity: String(body.severity || "Medium").trim(),
-        status: String(body.status || "open").trim(),
-        summary: body.summary || {},
-        graphState: body.graphState || {},
-        notes: String(body.notes || "").trim(),
-        subjects: Array.isArray(body.subjects) ? body.subjects.slice(0, 200) : (existingCase?.subjects || []),
-        victims: Array.isArray(body.victims) ? body.victims.slice(0, 500) : (existingCase?.victims || []),
-        loss: body.loss || existingCase?.loss || null,
-        evidence: Array.isArray(body.evidence) ? body.evidence.slice(0, 500) : (existingCase?.evidence || []),
-        traceReport: body.traceReport || existingCase?.traceReport || null,
-        updatedAt: now,
-        createdAt: body.createdAt || existingCase?.createdAt || now,
-      };
-      const nextCases = [
-        nextCase,
-        ...cases.filter((item) => !(item.id === nextCase.id && belongsToProfile(item, profileId))),
-      ];
-
-      await writeJson(investigationCasesFile, nextCases);
+      const { nextCase, existingCase } = await mutateStore(investigationCasesFile, async (cases) => {
+        const collidingCase = body.id ? cases.find((item) => item.id === body.id) : null;
+        if (collidingCase && !belongsToProfile(collidingCase, profileId)) {
+          throw requestError(403, "You cannot modify another user's investigation case");
+        }
+        const existingCase = collidingCase || null;
+        const nextCase = {
+          id: body.id || makeId("case"),
+          profileId,
+          title: String(body.title || `Investigation ${rootAddress.slice(0, 10)}`).trim(),
+          rootAddress,
+          networkKey: String(body.networkKey || "UNKNOWN").trim(),
+          severity: String(body.severity || "Medium").trim(),
+          status: String(body.status || "open").trim(),
+          summary: body.summary || {},
+          graphState: body.graphState || {},
+          notes: String(body.notes || "").trim(),
+          subjects: Array.isArray(body.subjects) ? body.subjects.slice(0, 200) : (existingCase?.subjects || []),
+          victims: Array.isArray(body.victims) ? body.victims.slice(0, 500) : (existingCase?.victims || []),
+          loss: body.loss || existingCase?.loss || null,
+          evidence: Array.isArray(body.evidence) ? body.evidence.slice(0, 500) : (existingCase?.evidence || []),
+          traceReport: body.traceReport || existingCase?.traceReport || null,
+          updatedAt: now,
+          createdAt: body.createdAt || existingCase?.createdAt || now,
+        };
+        return {
+          items: [nextCase, ...cases.filter((item) => !(item.id === nextCase.id && belongsToProfile(item, profileId)))],
+          result: { nextCase, existingCase },
+        };
+      });
       await appendAuditEvent({
         actor: user,
         action: existingCase ? "case.update" : "case.create",
@@ -9205,11 +9250,13 @@ const server = createServer(async (request, response) => {
       const user = await requireAuthenticatedUser(request, response);
       if (!user) return;
       const id = idFromUrl(url, "/api/cases/");
-      const cases = await readJson(investigationCasesFile);
-      const deletedCase = cases.find((item) => item.id === id && belongsToProfile(item, user.id)) || null;
-      const nextCases = cases.filter((item) => !(item.id === id && belongsToProfile(item, user.id)));
-
-      await writeJson(investigationCasesFile, nextCases);
+      const deletedCase = await mutateStore(investigationCasesFile, async (cases) => {
+        const deletedCase = cases.find((item) => item.id === id && belongsToProfile(item, user.id)) || null;
+        return {
+          items: cases.filter((item) => !(item.id === id && belongsToProfile(item, user.id))),
+          result: deletedCase,
+        };
+      });
       if (deletedCase) {
         await appendAuditEvent({
           actor: user,
@@ -9220,7 +9267,7 @@ const server = createServer(async (request, response) => {
         });
       }
       await invalidateDerivedAnalysisCache();
-      send(response, 200, { ok: true, deleted: cases.length - nextCases.length });
+      send(response, 200, { ok: true, deleted: deletedCase ? 1 : 0 });
       return;
     }
 
@@ -9707,29 +9754,31 @@ const server = createServer(async (request, response) => {
       const user = await requireAuthenticatedUser(request, response);
       if (!user) return;
       const profile = await readBody(request);
+      const address = normalizeSupportedAddress(profile.address);
 
-      if (!profile.address) {
-        send(response, 400, { error: "address is required" });
+      if (!address) {
+        send(response, 400, { error: "A valid EVM, TRON or Bitcoin address is required" });
         return;
       }
 
       const now = new Date().toISOString();
       const profileId = user.id;
-      const profiles = await readProfiles();
-      const existing = profiles.find((item) => item.address === profile.address && belongsToProfile(item, profileId));
-      const nextProfile = normalizeWalletProfile({
-        ...existing,
-        ...profile,
-        profileId,
-        createdAt: existing?.createdAt || profile.createdAt || now,
-        updatedAt: now,
-      }, profileId);
-      const nextProfiles = [
-        nextProfile,
-        ...profiles.filter((item) => !(item.address === profile.address && belongsToProfile(item, profileId))),
-      ];
-
-      await writeProfiles(nextProfiles);
+      const { nextProfile, existing } = await mutateStore(walletProfilesFile, async (rawProfiles) => {
+        const profiles = rawProfiles.map((item) => normalizeScopedItem(item, item.profileId));
+        const existing = profiles.find((item) => item.address === address && belongsToProfile(item, profileId));
+        const nextProfile = normalizeWalletProfile({
+          ...existing,
+          ...profile,
+          address,
+          profileId,
+          createdAt: existing?.createdAt || profile.createdAt || now,
+          updatedAt: now,
+        }, profileId);
+        return {
+          items: [nextProfile, ...profiles.filter((item) => !(item.address === address && belongsToProfile(item, profileId)))],
+          result: { nextProfile, existing },
+        };
+      });
       await appendAuditEvent({
         actor: user,
         action: existing ? "wallet_profile.update" : "wallet_profile.create",

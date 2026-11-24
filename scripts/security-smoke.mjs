@@ -154,6 +154,7 @@ try {
   assert.equal(auditResult.status, 200);
   const auditBody = await auditResult.json();
   assert.equal(auditBody.integrity, "sha256_hash_chain");
+  assert.equal(auditBody.verification?.valid, true);
   assert.equal(auditBody.items[0]?.action, "case.create");
   assert.match(auditBody.items[0]?.eventHash || "", /^[a-f0-9]{64}$/);
 

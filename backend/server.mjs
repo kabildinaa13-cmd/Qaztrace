@@ -789,6 +789,41 @@ function canonicalAuditValue(value) {
   return value;
 }
 
+function auditSeal(eventHash, previousSeal = "") {
+  return createHmac("sha256", authSecret)
+    .update(`${previousSeal}:${eventHash}`)
+    .digest("hex");
+}
+
+function verifyAuditChain(events = []) {
+  let previousHash = "";
+  let previousSeal = "";
+  let sealed = 0;
+  let legacy = 0;
+
+  for (const event of [...events].reverse()) {
+    const { eventHash, integritySeal, ...unsignedEvent } = event;
+    const expectedHash = createHash("sha256")
+      .update(JSON.stringify(canonicalAuditValue(unsignedEvent)))
+      .digest("hex");
+    if (event.previousHash !== previousHash || event.eventHash !== expectedHash) {
+      return { valid: false, sealed, legacy, reason: "hash_chain_mismatch" };
+    }
+    if (integritySeal) {
+      if (integritySeal !== auditSeal(eventHash, previousSeal)) {
+        return { valid: false, sealed, legacy, reason: "integrity_seal_mismatch" };
+      }
+      sealed += 1;
+      previousSeal = integritySeal;
+    } else {
+      legacy += 1;
+    }
+    previousHash = eventHash;
+  }
+
+  return { valid: true, sealed, legacy, reason: "" };
+}
+
 async function appendAuditEvent({ actor, action, entityType, entityId = "", before = null, after = null, reason = "", metadata = {} }) {
   return mutateStore(auditEventsFile, async (events) => {
     const previousHash = events[0]?.eventHash || "";
@@ -809,7 +844,8 @@ async function appendAuditEvent({ actor, action, entityType, entityId = "", befo
     const eventHash = createHash("sha256")
       .update(JSON.stringify(canonicalAuditValue(unsignedEvent)))
       .digest("hex");
-    const event = { ...unsignedEvent, eventHash };
+    const previousSeal = events[0]?.integritySeal || "";
+    const event = { ...unsignedEvent, eventHash, integritySeal: auditSeal(eventHash, previousSeal) };
     return { items: [event, ...events], result: event };
   });
 }
@@ -874,19 +910,20 @@ function parseCsvLine(line) {
 }
 
 async function importEntityLabelsFromCsv(csvText) {
-  const rows = String(csvText || "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const labels = await readEntityLabels();
-  const now = new Date().toISOString();
-  const existingKeys = new Set(
-    labels.map((label) => `${String(label.address || "").toLowerCase()}:${label.networkKey || "UNKNOWN"}`)
-  );
-  const imported = [];
-  let skipped = 0;
+  return withStoreMutationLock(entityLabelsFile, async () => {
+    const rows = String(csvText || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const labels = await readEntityLabels();
+    const now = new Date().toISOString();
+    const existingKeys = new Set(
+      labels.map((label) => `${String(label.address || "").toLowerCase()}:${label.networkKey || "UNKNOWN"}`)
+    );
+    const imported = [];
+    let skipped = 0;
 
-  for (const row of rows) {
+    for (const row of rows) {
     const [addressRaw, categoryRaw = "exchange", nameRaw = "Imported entity", networkRaw = "UNKNOWN", confidenceRaw = "80", sourceRaw = "csv-import", notesRaw = ""] = parseCsvLine(row);
     const address = String(addressRaw || "").trim();
     const networkKey = String(networkRaw || "UNKNOWN").trim() || "UNKNOWN";
@@ -914,13 +951,14 @@ async function importEntityLabelsFromCsv(csvText) {
       createdAt: now,
       updatedAt: now,
     });
-  }
+    }
 
-  if (imported.length) {
-    await writeEntityLabels([...imported, ...labels]);
-  }
+    if (imported.length) {
+      await writeEntityLabels([...imported, ...labels]);
+    }
 
-  return { imported: imported.length, skipped, rowCount: rows.length, total: labels.length + imported.length };
+    return { imported: imported.length, skipped, rowCount: rows.length, total: labels.length + imported.length };
+  });
 }
 
 function decodeXmlText(value = "") {
@@ -1089,20 +1127,21 @@ async function fetchOfacSlsFile(filename) {
 }
 
 async function importOfacEntityLabels(options = {}) {
-  const files = (Array.isArray(options.files) && options.files.length ? options.files : ofacSlsFiles)
+  return withStoreMutationLock(entityLabelsFile, async () => {
+    const files = (Array.isArray(options.files) && options.files.length ? options.files : ofacSlsFiles)
     .map((item) => String(item || "").trim())
     .filter(Boolean);
-  const labels = await readEntityLabels();
-  const now = new Date().toISOString();
-  const existingKeys = new Set(
-    labels.map((label) => `${String(label.address || "").toLowerCase()}:${label.networkKey || "UNKNOWN"}`)
-  );
-  const imported = [];
-  const fileResults = [];
-  let parsed = 0;
-  let skipped = 0;
+    const labels = await readEntityLabels();
+    const now = new Date().toISOString();
+    const existingKeys = new Set(
+      labels.map((label) => `${String(label.address || "").toLowerCase()}:${label.networkKey || "UNKNOWN"}`)
+    );
+    const imported = [];
+    const fileResults = [];
+    let parsed = 0;
+    let skipped = 0;
 
-  for (const file of files) {
+    for (const file of files) {
     const xmlText = await fetchOfacSlsFile(file);
     const parsedLabels = parseOfacEntityLabels(xmlText, file, now);
     parsed += parsedLabels.length;
@@ -1129,20 +1168,21 @@ async function importOfacEntityLabels(options = {}) {
       imported: fileImported,
       skipped: fileSkipped,
     });
-  }
+    }
 
-  if (imported.length) {
-    await writeEntityLabels([...imported, ...labels]);
-  }
+    if (imported.length) {
+      await writeEntityLabels([...imported, ...labels]);
+    }
 
-  return {
-    imported: imported.length,
-    skipped,
-    parsed,
-    total: labels.length + imported.length,
-    files: fileResults,
-    source: ofacSlsBaseUrl,
-  };
+    return {
+      imported: imported.length,
+      skipped,
+      parsed,
+      total: labels.length + imported.length,
+      files: fileResults,
+      source: ofacSlsBaseUrl,
+    };
+  });
 }
 
 async function readBody(request) {
@@ -8355,11 +8395,10 @@ function buildAlertText(rule, previous, current) {
 }
 
 async function appendAlertEvent(event) {
-  const events = await readJson(alertEventsFile);
-  const nextEvents = [event, ...events];
-
-  await writeJson(alertEventsFile, nextEvents);
-  return event;
+  return mutateStore(alertEventsFile, async (events) => ({
+    items: [event, ...events],
+    result: event,
+  }));
 }
 
 async function pollWatchlist({ profileId } = {}) {
@@ -8915,13 +8954,16 @@ const server = createServer(async (request, response) => {
       const user = await requireAuthenticatedUser(request, response);
       if (!user) return;
       const limit = Math.min(500, Math.max(1, Number(url.searchParams.get("limit") || 100)));
-      const events = (await readJson(auditEventsFile))
+      const allAuditEvents = await readJson(auditEventsFile);
+      const events = allAuditEvents
         .filter((event) => event.actorId === user.id)
         .slice(0, limit);
+      const verification = verifyAuditChain(allAuditEvents);
       send(response, 200, {
         items: events,
         count: events.length,
         integrity: "sha256_hash_chain",
+        verification,
       });
       return;
     }
@@ -9101,7 +9143,6 @@ const server = createServer(async (request, response) => {
       if (!user) return;
       if (!requireAdmin(user, response)) return;
       const body = await readBody(request);
-      const labels = await readEntityLabels();
       const now = new Date().toISOString();
       const address = normalizeSupportedAddress(body.address);
 
@@ -9127,21 +9168,23 @@ const server = createServer(async (request, response) => {
         send(response, 400, { error: "Demo, mock, fixture and synthetic labels are disabled." });
         return;
       }
-      const existingLabel = labels.find(
-        (label) =>
-          label.id === nextLabel.id ||
-          (label.address?.toLowerCase() === nextLabel.address.toLowerCase() && label.networkKey === nextLabel.networkKey)
-      ) || null;
-      const nextLabels = [
-        nextLabel,
-        ...labels.filter(
+      const existingLabel = await mutateStore(entityLabelsFile, async (labels) => {
+        const activeLabels = labels.filter((label) => !isDemoDataRecord(label));
+        const existing = activeLabels.find(
           (label) =>
-            label.id !== nextLabel.id &&
-            !(label.address?.toLowerCase() === nextLabel.address.toLowerCase() && label.networkKey === nextLabel.networkKey)
-        ),
-      ];
-
-      await writeEntityLabels(nextLabels);
+            label.id === nextLabel.id ||
+            (label.address?.toLowerCase() === nextLabel.address.toLowerCase() && label.networkKey === nextLabel.networkKey)
+        ) || null;
+        const nextLabels = [
+          nextLabel,
+          ...activeLabels.filter(
+            (label) =>
+              label.id !== nextLabel.id &&
+              !(label.address?.toLowerCase() === nextLabel.address.toLowerCase() && label.networkKey === nextLabel.networkKey)
+          ),
+        ];
+        return { items: nextLabels, result: existing };
+      });
       await appendAuditEvent({
         actor: user,
         action: existingLabel ? "label.update" : "label.create",
@@ -9161,11 +9204,15 @@ const server = createServer(async (request, response) => {
       if (!user) return;
       if (!requireAdmin(user, response)) return;
       const id = idFromUrl(url, "/api/entities/");
-      const labels = await readEntityLabels();
-      const deletedLabel = labels.find((label) => label.id === id) || null;
-      const nextLabels = labels.filter((label) => label.id !== id);
-
-      await writeEntityLabels(nextLabels);
+      const { deletedLabel, deleted } = await mutateStore(entityLabelsFile, async (labels) => {
+        const activeLabels = labels.filter((label) => !isDemoDataRecord(label));
+        const deletedLabel = activeLabels.find((label) => label.id === id) || null;
+        const nextLabels = activeLabels.filter((label) => label.id !== id);
+        return {
+          items: nextLabels,
+          result: { deletedLabel, deleted: activeLabels.length - nextLabels.length },
+        };
+      });
       if (deletedLabel) {
         await appendAuditEvent({
           actor: user,
@@ -9176,7 +9223,7 @@ const server = createServer(async (request, response) => {
         });
       }
       await invalidateDerivedAnalysisCache();
-      send(response, 200, { ok: true, deleted: labels.length - nextLabels.length });
+      send(response, 200, { ok: true, deleted });
       return;
     }
 

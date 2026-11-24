@@ -3,22 +3,18 @@ const AUTH_KEY = "chainSentinelAuth";
 let inMemorySession = null;
 
 export function loadAuthSession() {
-  try {
-    const stored = JSON.parse(localStorage.getItem(AUTH_KEY) || "null");
-    return stored || inMemorySession;
-  } catch {
-    // Some embedded browsers can restrict localStorage. A running session must
-    // still be usable there; persistence will resume when storage is available.
-    return inMemorySession;
-  }
+  return inMemorySession;
 }
 
 export function saveAuthSession(session) {
   inMemorySession = session;
   try {
-    localStorage.setItem(AUTH_KEY, JSON.stringify(session));
+    // Remove tokens saved by older application versions. A signed-in session
+    // now lasts only for the current tab lifetime and cannot be recovered
+    // from persistent browser storage after it is closed or refreshed.
+    localStorage.removeItem(AUTH_KEY);
   } catch {
-    // Keep the current local session active without persistent browser storage.
+    // The in-memory session remains available if storage is restricted.
   }
 }
 

@@ -1,8 +1,9 @@
 import { createServer } from "node:http";
-import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import pg from "pg";
 import { createApiV2 } from "./v2/router.mjs";
 import { lookupPublicAttribution } from "./public-attribution.mjs";
@@ -68,6 +69,18 @@ const nftExposureCacheTtlMs = Number(process.env.NFT_EXPOSURE_CACHE_TTL_MS || 60
 const arkhamCacheTtlMs = Number(process.env.ARKHAM_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
 const graphCacheTtlMs = Number(process.env.GRAPH_CACHE_TTL_MS || 10 * 60 * 1000);
 const authTokenTtlMs = Number(process.env.AUTH_TOKEN_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const registrationEnabled = String(process.env.REGISTRATION_ENABLED || "false").toLowerCase() === "true";
+const configuredAdminUsernames = new Set(
+  String(process.env.ADMIN_USERNAMES || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+);
+const loginRateLimit = Math.max(3, Math.min(30, Number(process.env.LOGIN_RATE_LIMIT || 8)));
+const registerRateLimit = Math.max(1, Math.min(20, Number(process.env.REGISTER_RATE_LIMIT || 3)));
+const authRateWindowMs = Math.max(60_000, Math.min(24 * 60 * 60 * 1000, Number(process.env.AUTH_RATE_WINDOW_MS || 15 * 60 * 1000)));
+const scryptAsync = promisify(scrypt);
+const authRateBuckets = new Map();
 const { Pool } = pg;
 const pool = usePostgres ? new Pool({ connectionString: databaseUrl }) : null;
 let etherscanQueue = Promise.resolve();
@@ -585,6 +598,44 @@ function normalizeUsername(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function effectiveUserRole(user) {
+  if (configuredAdminUsernames.has(normalizeUsername(user?.username))) return "admin";
+  return user?.role === "admin" ? "admin" : "analyst";
+}
+
+function requireAdmin(user, response) {
+  if (effectiveUserRole(user) === "admin") return true;
+  send(response, 403, { error: "Administrator role required" });
+  return false;
+}
+
+function clientAddress(request) {
+  return String(request.headers["x-forwarded-for"] || request.socket.remoteAddress || "unknown")
+    .split(",")[0]
+    .trim();
+}
+
+function consumeAuthRateLimit(request, response, scope, subject, limit) {
+  const now = Date.now();
+  const key = `${scope}:${clientAddress(request)}:${normalizeUsername(subject) || "anonymous"}`;
+
+  for (const [bucketKey, bucket] of authRateBuckets) {
+    if (bucket.resetAt <= now) authRateBuckets.delete(bucketKey);
+  }
+
+  const bucket = authRateBuckets.get(key) || { count: 0, resetAt: now + authRateWindowMs };
+  if (bucket.count >= limit) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+    response.setHeader("Retry-After", String(retryAfterSeconds));
+    send(response, 429, { error: "Too many attempts. Try again later." });
+    return false;
+  }
+
+  bucket.count += 1;
+  authRateBuckets.set(key, bucket);
+  return true;
+}
+
 function userIdFromUsername(username) {
   return `user-${createHash("sha256").update(normalizeUsername(username)).digest("hex").slice(0, 18)}`;
 }
@@ -598,18 +649,19 @@ function safeUser(user) {
     id: user.id,
     username: user.username,
     displayName: user.displayName || user.username,
+    role: effectiveUserRole(user),
     createdAt: user.createdAt,
     updatedAt: user.updatedAt,
   };
 }
 
-function hashPassword(password) {
+async function hashPassword(password) {
   const salt = randomBytes(16).toString("hex");
-  const hash = scryptSync(String(password), salt, 64).toString("hex");
+  const hash = Buffer.from(await scryptAsync(String(password), salt, 64)).toString("hex");
   return `scrypt$${salt}$${hash}`;
 }
 
-function verifyPassword(password, storedHash = "") {
+async function verifyPassword(password, storedHash = "") {
   const [scheme, salt, hash] = String(storedHash).split("$");
 
   if (scheme !== "scrypt" || !salt || !hash) {
@@ -617,13 +669,14 @@ function verifyPassword(password, storedHash = "") {
   }
 
   const expected = Buffer.from(hash, "hex");
-  const actual = scryptSync(String(password), salt, expected.length);
+  const actual = Buffer.from(await scryptAsync(String(password), salt, expected.length));
   return expected.length === actual.length && timingSafeEqual(expected, actual);
 }
 
 function createAuthToken(user) {
   const expiresAt = Date.now() + authTokenTtlMs;
-  const payload = `${user.id}.${expiresAt}`;
+  const sessionVersion = Number(user.sessionVersion || 0);
+  const payload = `${user.id}.${sessionVersion}.${expiresAt}`;
   const signature = createHmac("sha256", authSecret).update(payload).digest("base64url");
   return `${payload}.${signature}`;
 }
@@ -631,12 +684,12 @@ function createAuthToken(user) {
 function verifyAuthToken(token = "") {
   const parts = String(token).split(".");
 
-  if (parts.length !== 3) {
+  if (parts.length !== 4) {
     return null;
   }
 
-  const [userId, expiresAt, signature] = parts;
-  const payload = `${userId}.${expiresAt}`;
+  const [userId, sessionVersion, expiresAt, signature] = parts;
+  const payload = `${userId}.${sessionVersion}.${expiresAt}`;
   const expected = createHmac("sha256", authSecret).update(payload).digest("base64url");
 
   if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
@@ -647,7 +700,7 @@ function verifyAuthToken(token = "") {
     return null;
   }
 
-  return { userId };
+  return { userId, sessionVersion: Number(sessionVersion) };
 }
 
 async function getAuthenticatedUser(request) {
@@ -660,7 +713,9 @@ async function getAuthenticatedUser(request) {
   }
 
   const users = await readJson(usersFile);
-  return users.find((user) => user.id === verified.userId) || null;
+  const user = users.find((item) => item.id === verified.userId) || null;
+  if (!user || Number(user.sessionVersion || 0) !== verified.sessionVersion) return null;
+  return user;
 }
 
 async function requireAuthenticatedUser(request, response) {
@@ -1407,7 +1462,7 @@ function idFromUrl(url, prefix) {
 }
 
 function makeId(prefix) {
-  return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  return `${prefix}_${Date.now()}_${randomBytes(12).toString("hex")}`;
 }
 
 function hexToBigInt(value) {
@@ -8251,7 +8306,7 @@ function buildAlertText(rule, previous, current) {
 
 async function appendAlertEvent(event) {
   const events = await readJson(alertEventsFile);
-  const nextEvents = [event, ...events].slice(0, 1000);
+  const nextEvents = [event, ...events];
 
   await writeJson(alertEventsFile, nextEvents);
   return event;
@@ -8573,6 +8628,8 @@ const server = createServer(async (request, response) => {
       const username = normalizeUsername(body.username);
       const password = String(body.password || "");
 
+      if (!consumeAuthRateLimit(request, response, "register", username, registerRateLimit)) return;
+
       if (!/^[a-z0-9._-]{3,40}$/.test(username)) {
         send(response, 400, { error: "Login must be 3-40 chars: a-z, 0-9, dot, underscore or dash." });
         return;
@@ -8585,6 +8642,13 @@ const server = createServer(async (request, response) => {
 
       const users = await readJson(usersFile);
 
+      // A first local user can bootstrap the system. Subsequent self-registration
+      // must be explicitly enabled by the system owner.
+      if (users.length > 0 && !registrationEnabled) {
+        send(response, 403, { error: "Registration is closed. Ask an administrator to create an account." });
+        return;
+      }
+
       if (users.some((user) => user.username === username)) {
         send(response, 409, { error: "Login already exists." });
         return;
@@ -8595,12 +8659,14 @@ const server = createServer(async (request, response) => {
         id: userIdFromUsername(username),
         username,
         displayName: String(body.displayName || username).trim() || username,
-        passwordHash: hashPassword(password),
+        passwordHash: await hashPassword(password),
+        role: users.length === 0 ? "admin" : "analyst",
+        sessionVersion: 0,
         createdAt: now,
         updatedAt: now,
       };
 
-      await writeJson(usersFile, [user, ...users].slice(0, 500));
+      await writeJson(usersFile, [user, ...users]);
       send(response, 200, { user: safeUser(user), token: createAuthToken(user) });
       return;
     }
@@ -8609,10 +8675,11 @@ const server = createServer(async (request, response) => {
       const body = await readBody(request);
       const username = normalizeUsername(body.username);
       const password = String(body.password || "");
+      if (!consumeAuthRateLimit(request, response, "login", username, loginRateLimit)) return;
       const users = await readJson(usersFile);
       const user = users.find((item) => item.username === username);
 
-      if (!user || !verifyPassword(password, user.passwordHash)) {
+      if (!user || !(await verifyPassword(password, user.passwordHash))) {
         send(response, 401, { error: "Invalid login or password." });
         return;
       }
@@ -8629,6 +8696,18 @@ const server = createServer(async (request, response) => {
       }
 
       send(response, 200, { user: safeUser(user) });
+      return;
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/auth/logout") {
+      const user = await requireAuthenticatedUser(request, response);
+      if (!user) return;
+      const users = await readJson(usersFile);
+      const nextUsers = users.map((item) => item.id === user.id
+        ? { ...item, sessionVersion: Number(item.sessionVersion || 0) + 1, updatedAt: new Date().toISOString() }
+        : item);
+      await writeJson(usersFile, nextUsers);
+      send(response, 200, { ok: true });
       return;
     }
 
@@ -8720,7 +8799,12 @@ const server = createServer(async (request, response) => {
       const now = new Date().toISOString();
       const profileId = user.id;
       const rules = await readJson(watchlistRulesFile);
-      const existing = rule.id ? rules.find((item) => item.id === rule.id) : null;
+      const collidingRule = rule.id ? rules.find((item) => item.id === rule.id) : null;
+      if (collidingRule && !belongsToProfile(collidingRule, profileId)) {
+        send(response, 403, { error: "You cannot modify another user's watchlist rule" });
+        return;
+      }
+      const existing = collidingRule || null;
       const nextRule = {
         ...existing,
         ...rule,
@@ -8732,8 +8816,8 @@ const server = createServer(async (request, response) => {
       };
       const nextRules = [
         nextRule,
-        ...rules.filter((item) => item.id !== nextRule.id),
-      ].slice(0, 1000);
+        ...rules.filter((item) => !(item.id === nextRule.id && belongsToProfile(item, profileId))),
+      ];
 
       await writeJson(watchlistRulesFile, nextRules);
       await appendAuditEvent({
@@ -8798,7 +8882,17 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/api/watchlist/poll") {
       const user = await requireAuthenticatedUser(request, response);
       if (!user) return;
-      const result = await pollWatchlist({ profileId: user.id });
+      if (polling) {
+        send(response, 409, { error: "Watchlist polling is already running" });
+        return;
+      }
+      polling = true;
+      let result;
+      try {
+        result = await pollWatchlist({ profileId: user.id });
+      } finally {
+        polling = false;
+      }
       send(response, 200, result);
       return;
     }
@@ -8923,6 +9017,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/api/entities/ofac") {
       const user = await requireAuthenticatedUser(request, response);
       if (!user) return;
+      if (!requireAdmin(user, response)) return;
       const body = await readBody(request);
       const result = await importOfacEntityLabels(body);
       await appendAuditEvent({
@@ -8940,6 +9035,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/api/entities/import-csv") {
       const user = await requireAuthenticatedUser(request, response);
       if (!user) return;
+      if (!requireAdmin(user, response)) return;
       const body = await readBody(request);
       const result = await importEntityLabelsFromCsv(body.csv || body.text || "");
       await appendAuditEvent({
@@ -8956,6 +9052,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && url.pathname === "/api/entities") {
       const user = await requireAuthenticatedUser(request, response);
       if (!user) return;
+      if (!requireAdmin(user, response)) return;
       const body = await readBody(request);
       const labels = await readEntityLabels();
       const now = new Date().toISOString();
@@ -9015,6 +9112,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "DELETE" && url.pathname.startsWith("/api/entities/")) {
       const user = await requireAuthenticatedUser(request, response);
       if (!user) return;
+      if (!requireAdmin(user, response)) return;
       const id = idFromUrl(url, "/api/entities/");
       const labels = await readEntityLabels();
       const deletedLabel = labels.find((label) => label.id === id) || null;
@@ -9052,7 +9150,12 @@ const server = createServer(async (request, response) => {
       const now = new Date().toISOString();
       const rootAddress = String(body.rootAddress || "").trim();
       const profileId = user.id;
-      const existingCase = body.id ? cases.find((item) => item.id === body.id && belongsToProfile(item, profileId)) : null;
+      const collidingCase = body.id ? cases.find((item) => item.id === body.id) : null;
+      if (collidingCase && !belongsToProfile(collidingCase, profileId)) {
+        send(response, 403, { error: "You cannot modify another user's investigation case" });
+        return;
+      }
+      const existingCase = collidingCase || null;
 
       if (!rootAddress) {
         send(response, 400, { error: "rootAddress is required" });
@@ -9078,7 +9181,10 @@ const server = createServer(async (request, response) => {
         updatedAt: now,
         createdAt: body.createdAt || existingCase?.createdAt || now,
       };
-      const nextCases = [nextCase, ...cases.filter((item) => item.id !== nextCase.id)].slice(0, 1000);
+      const nextCases = [
+        nextCase,
+        ...cases.filter((item) => !(item.id === nextCase.id && belongsToProfile(item, profileId))),
+      ];
 
       await writeJson(investigationCasesFile, nextCases);
       await appendAuditEvent({
@@ -9621,7 +9727,7 @@ const server = createServer(async (request, response) => {
       const nextProfiles = [
         nextProfile,
         ...profiles.filter((item) => !(item.address === profile.address && belongsToProfile(item, profileId))),
-      ].slice(0, 500);
+      ];
 
       await writeProfiles(nextProfiles);
       await appendAuditEvent({
@@ -9666,7 +9772,13 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    send(response, Number(error.statusCode || 500), { error: error.message });
+    const statusCode = Number(error.statusCode || 500);
+    if (statusCode >= 500) {
+      logger.error("Unhandled API error", error);
+      send(response, 500, { error: "Internal server error" });
+      return;
+    }
+    send(response, statusCode, { error: error.message || "Request failed" });
   }
 });
 

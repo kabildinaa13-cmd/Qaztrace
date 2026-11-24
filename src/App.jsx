@@ -9,7 +9,7 @@ import {
 } from "./services/alertApi";
 import { getArkhamAddressIntelligence } from "./services/arkhamApi";
 import { listAuditEvents } from "./services/auditApi";
-import { clearAuthSession, getCurrentUser, loadAuthSession, loginUser, registerUser } from "./services/authApi";
+import { clearAuthSession, getCurrentUser, loadAuthSession, loginUser, logoutUser, registerUser } from "./services/authApi";
 import { attributeAddresses } from "./services/attributionApi";
 import { askInvestigatorAssistant, getAssistantStatus } from "./services/assistantApi";
 import { deleteInvestigationCase, listInvestigationCases, upsertInvestigationCase } from "./services/caseApi";
@@ -994,7 +994,7 @@ function App() {
   };
 
   const logout = () => {
-    clearAuthSession();
+    logoutUser().catch(() => clearAuthSession());
     setAuthSession(null);
     setAddress("");
     setSearchValue("");

@@ -63,6 +63,17 @@ export function registerUser(payload) {
   return authRequest("/api/auth/register", payload);
 }
 
+export async function logoutUser() {
+  try {
+    await fetch(`${API_BASE}/api/auth/logout`, {
+      method: "POST",
+      headers: authHeaders(),
+    });
+  } finally {
+    clearAuthSession();
+  }
+}
+
 export async function getCurrentUser() {
   const response = await fetch(`${API_BASE}/api/auth/me`, {
     headers: authHeaders(),

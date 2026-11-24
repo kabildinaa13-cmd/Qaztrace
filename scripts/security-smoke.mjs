@@ -15,6 +15,8 @@ const processHandle = spawn(process.execPath, ["backend/server.mjs"], {
     STORAGE_DRIVER: "json",
     AUTH_SECRET: "security-smoke-secret-not-for-production-0123456789",
     CORS_ALLOWED_ORIGINS: "http://localhost:5174,http://127.0.0.1:5174",
+    REGISTRATION_ENABLED: "true",
+    LOGIN_RATE_LIMIT: "3",
     DATA_DIR: dataDir,
   },
   stdio: ["ignore", "pipe", "pipe"],
@@ -111,6 +113,42 @@ try {
     body: JSON.stringify({ title: "Security smoke case", rootAddress: "0x0000000000000000000000000000000000000001" }),
   });
   assert.equal(createdCase.status, 200);
+  const createdCaseBody = await createdCase.json();
+
+  const analystRegistration = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "security-analyst", password: "correct-horse-battery-staple" }),
+  });
+  assert.equal(analystRegistration.status, 200);
+  const analystSession = await analystRegistration.json();
+  const analystHeaders = {
+    Authorization: `Bearer ${analystSession.token}`,
+    "Content-Type": "application/json",
+  };
+
+  const forbiddenCaseOverwrite = await fetch(`${baseUrl}/api/cases`, {
+    method: "POST",
+    headers: analystHeaders,
+    body: JSON.stringify({
+      id: createdCaseBody.id,
+      title: "Attempted overwrite",
+      rootAddress: "0x0000000000000000000000000000000000000002",
+    }),
+  });
+  assert.equal(forbiddenCaseOverwrite.status, 403);
+
+  const forbiddenLabelWrite = await fetch(`${baseUrl}/api/entities`, {
+    method: "POST",
+    headers: analystHeaders,
+    body: JSON.stringify({
+      address: "0x0000000000000000000000000000000000000002",
+      networkKey: "ETH",
+      category: "exchange",
+      name: "Unauthorized label",
+    }),
+  });
+  assert.equal(forbiddenLabelWrite.status, 403);
 
   const auditResult = await fetch(`${baseUrl}/api/audit`, { headers: authorizedHeaders });
   assert.equal(auditResult.status, 200);
@@ -118,6 +156,29 @@ try {
   assert.equal(auditBody.integrity, "sha256_hash_chain");
   assert.equal(auditBody.items[0]?.action, "case.create");
   assert.match(auditBody.items[0]?.eventHash || "", /^[a-f0-9]{64}$/);
+
+  const logout = await fetch(`${baseUrl}/api/auth/logout`, {
+    method: "POST",
+    headers: authorizedHeaders,
+  });
+  assert.equal(logout.status, 200);
+  const revokedSession = await fetch(`${baseUrl}/api/auth/me`, { headers: authorizedHeaders });
+  assert.equal(revokedSession.status, 401);
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "rate-test", password: "wrong-password" }),
+    });
+    assert.equal(response.status, 401);
+  }
+  const limitedLogin = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "rate-test", password: "wrong-password" }),
+  });
+  assert.equal(limitedLogin.status, 429);
 
   process.stdout.write("Security smoke checks passed.\n");
 } finally {

@@ -20,7 +20,6 @@
     "preview": "vite preview --host 127.0.0.1 --port 5174 --strictPort"
   },
   "dependencies": {
-    "@openai/codex": "^0.137.0",
     "@vitejs/plugin-react": "^5.0.0",
     "lucide-react": "^1.17.0",
     "pg": "^8.21.0",
